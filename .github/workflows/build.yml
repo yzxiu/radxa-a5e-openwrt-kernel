@@ -153,6 +153,8 @@ jobs:
     needs: build
     if: needs.build.result == 'success'
     runs-on: ubuntu-24.04
+    permissions:
+      contents: write
     steps:
       - name: download artifact
         uses: actions/download-artifact@v4
@@ -187,7 +189,12 @@ jobs:
           if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
             TAG="$GITHUB_REF_NAME"; TITLE="A5E kernel $GITHUB_REF_NAME"; EXTRA=""
           else
-            TAG="dev-build"; TITLE="A5E kernel dev-build ($KVER)"; EXTRA="--prerelease"
+            # 非 tag（push/dispatch）→ 按 UTC 日期时分秒+run号 生成唯一 dev tag，
+            # 每次一条独立 prerelease，不再固定 dev-build 反复覆盖。
+            STAMP="$(date -u +%Y%m%d-%H%M%S)"
+            TAG="dev-${STAMP}-r${GITHUB_RUN_NUMBER}"
+            TITLE="A5E kernel dev-${STAMP} ($KVER, run #${GITHUB_RUN_NUMBER})"
+            EXTRA="--prerelease"
           fi
           NOTES="**Automated build** from commit \`${GITHUB_SHA}\` (run #${GITHUB_RUN_NUMBER})
 
@@ -197,7 +204,8 @@ jobs:
           - modules-and-dtb.tar — 处理后 /lib/modules(.ko) + /usr/lib/linux-image(dtb)，.bin 已删
           - BUILD_INFO.env / sha256sums.txt — 元数据与校验和"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            # 已存在（滚动的 dev-build）：覆盖产物，把 target 移到本次 commit
+            # 正式 tag 重跑才命中：覆盖产物、target 移到本次 commit
+            # （dev 已改时间戳唯一 tag，不会走到这一支）
             gh release upload "$TAG" dist/* --clobber
             [[ "${GITHUB_REF}" != refs/tags/* ]] && gh release edit "$TAG" --target "$GITHUB_SHA" --title "$TITLE"
             echo "updated existing release: $TAG"
@@ -205,4 +213,17 @@ jobs:
             # shellcheck disable=SC2086
             gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TITLE" $EXTRA --notes "$NOTES"
             echo "created release: $TAG"
+          fi
+
+      # 一次性清理旧“滚动 dev-build”机制遗留的 release（+tag）。
+      # 删除成功后本步每轮仅 no-op（view 不命中），无害且防误残留。
+      - name: cleanup legacy dev-build release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if gh release view dev-build >/dev/null 2>&1; then
+            gh release delete dev-build --cleanup-tag --yes && echo "✓ 已删除遗留 dev-build release(+tag)"
+          else
+            echo "dev-build 不存在，跳过"
           fi
