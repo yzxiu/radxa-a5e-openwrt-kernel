@@ -145,10 +145,13 @@ jobs:
           retention-days: 60
           if-no-files-found: error
 
-  # 打了 v* tag 时把产物 attach 到 GitHub Release
+  # 构建成功后发 Release：
+  #   · 打 v* tag           → 正式 release（用 tag 名）
+  #   · push main / dispatch → 滚动 prerelease "dev-build"（每次覆盖产物、
+  #     target 移到最新 commit，下载它永远是最新 main 构建）
   release:
     needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: needs.build.result == 'success'
     runs-on: ubuntu-24.04
     steps:
       - name: download artifact
@@ -164,7 +167,7 @@ jobs:
           cp bundle/linux-image-*.deb dist/
           cp bundle/linux-headers-*.deb dist/ 2>/dev/null || true
           cp bundle/linux-libc-dev_*.deb dist/ 2>/dev/null || true
-          KVER=$(ls bundle/root/lib/modules/)
+          KVER=$(ls bundle/root/lib/modules/ | head -1)
           cp bundle/vmlinuz "dist/vmlinuz-$KVER"
           cp bundle/sha256sums.txt dist/
           cp bundle/BUILD_INFO.env dist/
@@ -172,21 +175,31 @@ jobs:
             "root/lib/modules" "root/usr/lib/linux-image-$KVER"
           ls -lh dist/
 
-      - name: gh release upload
+      - name: publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "${{ github.ref_name }}" \
-            --verify-tag \
-            --title "A5E kernel ${{ github.ref_name }}" \
-            --notes "**Automated build** from commit \`${{ github.sha }}\`
+          set -euo pipefail
+          KVER=$(ls bundle/root/lib/modules/ | head -1)
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            TAG="$GITHUB_REF_NAME"; TITLE="A5E kernel $GITHUB_REF_NAME"; EXTRA=""
+          else
+            TAG="dev-build"; TITLE="A5E kernel dev-build ($KVER)"; EXTRA="--prerelease"
+          fi
+          NOTES="**Automated build** from commit \`${GITHUB_SHA}\` (run #${GITHUB_RUN_NUMBER})
 
           产物：
-          - \`linux-image-*.deb\` — bridge / firewall4 / tproxy 已 builtin（进 vmlinux，不再走 modprobe）
-          - \`vmlinuz-*\` — **未压缩** ARM64 Image，U-Boot extlinux 直接可用
-          - \`modules-and-dtb.tar\` — 处理后的 \`/lib/modules/\` 和 \`/usr/lib/linux-image-*/\`
-            · \`.ko.xz\` 全部展开成 \`.ko\`
-            · \`modules.dep\` 等元数据里的 \`.ko.xz\` 路径已 sed 成 \`.ko\`
-            · \`.bin\` 缓存已删除（OpenWrt kmodloader 无 xz、无 bin 支持）
-          - \`sha256sums.txt\` — 校验和" \
-            dist/*
+          - linux-image-*.deb — bridge / firewall4 / tproxy 已 builtin（进 vmlinux，不走 modprobe）
+          - vmlinuz-$KVER — 未压缩 ARM64 Image，U-Boot extlinux 直接可用
+          - modules-and-dtb.tar — 处理后 /lib/modules(.ko) + /usr/lib/linux-image(dtb)，.bin 已删
+          - BUILD_INFO.env / sha256sums.txt — 元数据与校验和"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # 已存在（滚动的 dev-build）：覆盖产物，把 target 移到本次 commit
+            gh release upload "$TAG" dist/* --clobber
+            [[ "${GITHUB_REF}" != refs/tags/* ]] && gh release edit "$TAG" --target "$GITHUB_SHA" --title "$TITLE"
+            echo "updated existing release: $TAG"
+          else
+            # shellcheck disable=SC2086
+            gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TITLE" $EXTRA --notes "$NOTES"
+            echo "created release: $TAG"
+          fi
