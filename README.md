@@ -128,6 +128,7 @@ p3 里即可（分区 LBA 679936 / 488MB ext4）。参考 `docs/A5E-内核编译
 - 主项目：`../../OpenWrt-A5E-制作记录.md`（坑 7 讲清了 bridge 为什么加载不了）
 - 编译详细：`docs/A5E-内核编译-记录.md`（本 Actions 的前身调研 + 踩过的所有坑）
 - 替换流程：`docs/OpenWrt镜像-定制内核替换.md`（新内核塞进 `owrt-a5e.img` 的可复用步骤）
+- WiFi 驱动：`docs/A5E-WiFi驱动-AIC8800-调研.md`（AIC8800 DKMS 驱动结构、固件机制、集成路线图）
 
 ## License / 上游许可
 

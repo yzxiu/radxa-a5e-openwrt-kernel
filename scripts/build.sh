@@ -56,7 +56,15 @@ else
   echo "  已 patch 过或 pattern 不存在，skip"
 fi
 
-# ---------- 2. apply debian patches ----------
+# ---------- 2. vendor AIC8800 驱动源码（先于 patches：接线 patch 假设源码已在树内） ----------
+if [ -d "$REPO_DIR/vendor/aic8800" ]; then
+  echo "=== [2/4] vendor aic8800 → src/drivers/net/wireless/aic8800 ==="
+  rm -rf src/drivers/net/wireless/aic8800
+  cp -a "$REPO_DIR/vendor/aic8800" src/drivers/net/wireless/aic8800
+  echo "  $(find src/drivers/net/wireless/aic8800 -type f | wc -l) files copied"
+fi
+
+# ---------- 2.5 apply debian patches ----------
 echo "=== [2/4] apply debian patches (all -p1 from repo top) ==="
 for p in debian/patches/linux/000*.patch; do
   if [ ! -f "$p" ]; then continue; fi
@@ -91,18 +99,14 @@ cp "$FRAGMENT_SRC" src/arch/arm64/configs/a5e-openwrt.config
 #   - Radxa 上游的 KERNEL_DEFCONFIG="defconfig radxa.config" 已验证可跑通
 #   - Kbuild merge_config 语义：同 CONFIG 后出现的会覆盖先出现的
 #   - 避开多 fragment 命令行在某些内核 Kconfig 依赖下报“beyond Kconfig”的坑
-# 幂等：Actions 上 cache 恢复后重跑时，已 cat 过的不重复 cat
-if grep -q "^# ==== appended by radxa-a5e-openwrt-kernel" src/arch/arm64/configs/radxa.config 2>/dev/null; then
-  echo "  fragment 已 append 过，skip"
-else
-  {
-    echo ""
-    echo "# ==== appended by radxa-a5e-openwrt-kernel (a5e-openwrt.config) ===="
-    echo "# 目的：让 bridge / fw4 / tproxy 进 vmlinux，避开 OpenWrt kmodloader 依赖解析失灵"
-    grep "^CONFIG_" "$FRAGMENT_SRC"
-  } >> src/arch/arm64/configs/radxa.config
-  echo "  appended $(grep -cE '^CONFIG_' "$FRAGMENT_SRC") CONFIG lines to src/arch/arm64/configs/radxa.config"
-fi
+# 幂等：先删旧 appended 块再追加（fragment 内容更新后重跑也一致；Actions cache 恢复后安全）
+sed -i '/^# ==== appended by radxa-a5e-openwrt-kernel/,$d' src/arch/arm64/configs/radxa.config
+{
+  echo "# ==== appended by radxa-a5e-openwrt-kernel (a5e-openwrt.config) ===="
+  echo "# 目的：bridge/fw4/tproxy/wifi 进 vmlinux，避开 OpenWrt kmodloader 依赖解析失灵"
+  grep "^CONFIG_" "$FRAGMENT_SRC"
+} >> src/arch/arm64/configs/radxa.config
+echo "  appended $(grep -cE '^CONFIG_' "$FRAGMENT_SRC") CONFIG lines to src/arch/arm64/configs/radxa.config"
 
 # ---------- 4. build ----------
 echo "=== [4/4] make build ==="

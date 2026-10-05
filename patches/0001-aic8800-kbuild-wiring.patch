@@ -1,0 +1,17 @@
+--- a/src/drivers/net/wireless/Kconfig
++++ b/src/drivers/net/wireless/Kconfig
+@@ -42,4 +42,6 @@
+ 
+ source "drivers/net/wireless/virtual/Kconfig"
+ 
++source "drivers/net/wireless/aic8800/Kconfig"
++
+ endif # WLAN
+--- a/src/drivers/net/wireless/Makefile
++++ b/src/drivers/net/wireless/Makefile
+@@ -25,3 +25,5 @@
+ 
+ obj-$(CONFIG_WLAN) += legacy/
+ obj-$(CONFIG_WLAN) += virtual/
++
++obj-$(CONFIG_AICV_WLAN_SUPPORT) += aic8800/
