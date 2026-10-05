@@ -178,6 +178,9 @@ jobs:
       - name: publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+          # release job 没 checkout、工作目录无 .git；gh 默认从 git remote 推断仓库，
+          # 会报 “not a git repository”。显式给 GH_REPO 绑定目标仓库。
+          GH_REPO: ${{ github.repository }}
         run: |
           set -euo pipefail
           KVER=$(ls bundle/root/lib/modules/ | head -1)
