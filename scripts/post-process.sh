@@ -80,3 +80,15 @@ echo "  dtb:         $OUT_DIR/root/usr/lib/linux-image-$KVER/"
 
 # 生成 sha256（方便下游烧录/校验）
 ( cd "$OUT_DIR" && sha256sum vmlinuz linux-image-*.deb > sha256sums.txt 2>/dev/null || true )
+
+# 构建元数据 BUILD_INFO.env
+# Actions 会自动注入 GITHUB_* ；本地跑用 :- 兜底为 local。绝不依赖 workflow 的 ${{ inputs }}。
+{
+  echo "kernel_version=$KVER"
+  echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "run_id=${GITHUB_RUN_ID:-local}"
+  echo "run_url=${GITHUB_SERVER_URL:-https://github.com}/${GITHUB_REPOSITORY:-local}/actions/runs/${GITHUB_RUN_ID:-local}"
+  echo "commit=${GITHUB_SHA:-local}"
+  echo "source_ref=${KERNEL_REF:-${GITHUB_REF_NAME:-local}}"
+} > "$OUT_DIR/BUILD_INFO.env"
+cat "$OUT_DIR/BUILD_INFO.env"

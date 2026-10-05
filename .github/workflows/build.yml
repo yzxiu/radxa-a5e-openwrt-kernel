@@ -125,24 +125,9 @@ jobs:
       - name: verify (bridge + fw4 + tproxy 都进 vmlinux)
         run: ./scripts/verify.sh
 
-      - name: collect artifact metadata
-        env:
-          KERNEL_REF: ${{ inputs.kernel_ref || 'main' }}
-        run: |
-          set -eo pipefail
-          KVER=$(ls out/root/lib/modules/)
-          # push 事件无 inputs 上下文，step-env 的 inputs.kernel_ref 可能渲染为空；
-          # 去掉 set -u + 裸 $KERNEL_REF（会 unbound 导致本步 exit 1），显式兜底。
-          KERNEL_REF="${KERNEL_REF:-main}"
-          {
-            echo "kernel_version=$KVER"
-            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-            echo "run_id=${{ github.run_id }}"
-            echo "run_url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-            echo "commit=${{ github.sha }}"
-            echo "source_ref=$KERNEL_REF"
-          } > out/BUILD_INFO.env
-          cat out/BUILD_INFO.env
+      # BUILD_INFO.env 由 post-process.sh 末尾生成（用 Actions 自动注入的 GITHUB_*
+      # + :- 兜底）。不再单设 collect step：之前那个独立 step 里 step-env 引用
+      # inputs.kernel_ref 在 push 事件下的渲染会导致该步 exit 1。
 
       - name: upload artifact — full prepared bundle
         uses: actions/upload-artifact@v4
