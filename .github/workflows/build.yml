@@ -4,7 +4,8 @@ name: Build A5E OpenWrt Kernel
 #   1) 手动 dispatch：可选填 kernel_ref（上游 linux-aw2607 的分支/tag/sha），
 #      不填默认 main
 #   2) push：改 configs/** / patches/** / scripts/** / workflow 时自动构建
-#   3) 打 v* tag：release job 会把产物 attach 到 GitHub Release
+# 每次成功构建都会发布一个**正式 release**（不带 prerelease），tag 按 UTC 日期时分秒
+# +run号 生成唯一名，不依赖人工打 v* tag 触发。
 
 on:
   workflow_dispatch:
@@ -20,9 +21,6 @@ on:
       - 'patches/**'
       - 'scripts/**'
       - '.github/workflows/build.yml'
-  create:
-    tags:
-      - 'v*'
 
 permissions:
   contents: write
@@ -145,10 +143,8 @@ jobs:
           retention-days: 60
           if-no-files-found: error
 
-  # 构建成功后发 Release：
-  #   · 打 v* tag           → 正式 release（用 tag 名）
-  #   · push main / dispatch → 滚动 prerelease "dev-build"（每次覆盖产物、
-  #     target 移到最新 commit，下载它永远是最新 main 构建）
+  # 构建成功后发 Release：每次成功构建 → 一条正式 release
+  # （tag = rel-<UTC 日期时分秒>-r<run号>，唯一不覆盖、不依赖 v* tag 触发）
   release:
     needs: build
     if: needs.build.result == 'success'
@@ -186,17 +182,13 @@ jobs:
         run: |
           set -euo pipefail
           KVER=$(ls bundle/root/lib/modules/ | head -1)
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            TAG="$GITHUB_REF_NAME"; TITLE="A5E kernel $GITHUB_REF_NAME"; EXTRA=""
-          else
-            # 非 tag（push/dispatch）→ 按 UTC 日期时分秒+run号 生成唯一 dev tag，
-            # 每次一条独立 prerelease，不再固定 dev-build 反复覆盖。
-            STAMP="$(date -u +%Y%m%d-%H%M%S)"
-            TAG="dev-${STAMP}-r${GITHUB_RUN_NUMBER}"
-            TITLE="A5E kernel dev-${STAMP} ($KVER, run #${GITHUB_RUN_NUMBER})"
-            EXTRA="--prerelease"
-          fi
-          NOTES="**Automated build** from commit \`${GITHUB_SHA}\` (run #${GITHUB_RUN_NUMBER})
+          # 所有构建都发正式 release（不带 --prerelease），tag 按 UTC 时间戳+run号唯一，
+          # 不依赖人工打 v* tag 触发。
+          STAMP="$(date -u +%Y%m%d-%H%M%S)"
+          TAG="rel-${STAMP}-r${GITHUB_RUN_NUMBER}"
+          REPONAME="${GH_REPO##*/}"
+          TITLE="${REPONAME}-$(date -u +%Y%m%d-%H%M)"
+          NOTES="**正式 release** from commit \`${GITHUB_SHA}\` (run #${GITHUB_RUN_NUMBER})
 
           产物：
           - linux-image-*.deb — bridge / firewall4 / tproxy 已 builtin（进 vmlinux，不走 modprobe）
@@ -204,26 +196,14 @@ jobs:
           - modules-and-dtb.tar — 处理后 /lib/modules(.ko) + /usr/lib/linux-image(dtb)，.bin 已删
           - BUILD_INFO.env / sha256sums.txt — 元数据与校验和"
           if gh release view "$TAG" >/dev/null 2>&1; then
-            # 正式 tag 重跑才命中：覆盖产物、target 移到本次 commit
-            # （dev 已改时间戳唯一 tag，不会走到这一支）
             gh release upload "$TAG" dist/* --clobber
-            [[ "${GITHUB_REF}" != refs/tags/* ]] && gh release edit "$TAG" --target "$GITHUB_SHA" --title "$TITLE"
-            echo "updated existing release: $TAG"
+            gh release edit "$TAG" --title "$TITLE"
+            echo "updated release: $TAG"
           else
-            # shellcheck disable=SC2086
-            gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TITLE" $EXTRA --notes "$NOTES"
+            gh release create "$TAG" dist/* --target "$GITHUB_SHA" --title "$TITLE" --notes "$NOTES" \
+              || { echo "[warn] 直连 create 失败，改用 --draft 创建→上传→发布"; \
+                   gh release create "$TAG" --draft --target "$GITHUB_SHA" --title "$TITLE" --notes "$NOTES"; \
+                   gh release upload "$TAG" dist/* --clobber; \
+                   gh release edit "$TAG" --draft=false; }
             echo "created release: $TAG"
-          fi
-
-      # 一次性清理旧“滚动 dev-build”机制遗留的 release（+tag）。
-      # 删除成功后本步每轮仅 no-op（view 不命中），无害且防误残留。
-      - name: cleanup legacy dev-build release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          if gh release view dev-build >/dev/null 2>&1; then
-            gh release delete dev-build --cleanup-tag --yes && echo "✓ 已删除遗留 dev-build release(+tag)"
-          else
-            echo "dev-build 不存在，跳过"
           fi
