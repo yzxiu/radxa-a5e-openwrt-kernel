@@ -1,6 +1,8 @@
 # A5E WiFi 驱动（AIC8800）调研与集成方案
 
-> 状态：**调研完成，板上未验证**。bridge/firewall4 已根治（builtin）并烧录验收，WiFi 是下一个目标。
+> 状态：**驱动已 builtin 化并本地构建验证通过**（2026-10-06，feature/aic8800-builtin）。
+> 板上验证：模块方案已点亮（scan/AP 均通，见 §5 第一步记录）；builtin 内核待烧录验收。
+> bridge/firewall4 早前已根治（builtin）并烧录验收。
 > 相关：[A5E-内核编译-记录.md](A5E-内核编译-记录.md)（内核流水线）、
 > [OpenWrt镜像-定制内核替换.md](OpenWrt镜像-定制内核替换.md)（镜像替换流程）、
 > 主项目《OpenWrt-A5E-制作记录.md》坑 8 与展望节。
@@ -14,7 +16,7 @@
 | 内核 ABI | Radxa 预编译 `.ko` 的 vermagic = `6.6.98-1-aw2607`，与本仓库内核**完全兼容，可直接复用** |
 | 固件 | 必须随镜像分发（`request_firmware()` 运行时加载），约 300KB+ |
 | 当前镜像 | **无驱动、无固件**，WiFi 完全不可用 |
-| 推荐路线 | ① 手动塞 `.ko`+固件板上验证 → ② 验证通过后 builtin 化（vendor 进内核树） |
+| 推荐路线 | ✅ ① 模块手动注入板上验证通过 → ✅ ② builtin 化完成（vendor 进内核树） |
 
 ## 1. 硬件
 
@@ -95,7 +97,7 @@ WiFi 芯片是**半软硬分离**设计：跑 802.11 协议栈的代码在芯片
 > ⚠️ **待板上验证**：拷贝固件时到底哪个子目录/哪些文件被真正 request，
 > 以 `dmesg | grep -i firmware` 实测为准，不要盲目整目录搬运。
 
-## 3. 为什么不能像 bridge 一样"一行 CONFIG 编进内核"
+## 3. 为什么不能像 bridge 一样"一行 CONFIG 编进内核"（以及实际怎么做的）
 
 | | bridge / firewall4 | aic8800 |
 |---|---|---|
@@ -103,43 +105,55 @@ WiFi 芯片是**半软硬分离**设计：跑 802.11 协议栈的代码在芯片
 | Kconfig 符号 | 现成（`CONFIG_BRIDGE` 等） | 内核树里**不存在** `CONFIG_AIC_*` |
 | fragment 追加 | 直接生效 | 写了没东西可勾 |
 
-**但 builtin 化本身是可行的**，关键依据：驱动 Makefile 已是标准
-`obj-$(CONFIG_...)` 写法（AIC 官方给各芯片 BSP 的移植模板），天然支持 `=y`：
+### 3.1 意外发现：bsp 子模块自带一份 AIC8800，且 Radxa 官方是禁用的
 
-```makefile
-# SDIO/driver_fw/driver/aic8800/Makefile
-obj-$(CONFIG_AIC8800_BTLPM_SUPPORT) += aic8800_btlpm/
-obj-$(CONFIG_AIC8800_WLAN_SUPPORT) += aic8800_fdrv/
-obj-$(CONFIG_AIC_WLAN_SUPPORT)   += aic8800_bsp/
-```
+`linux-aw2607` 的 `bsp` 子模块（radxa/allwinner-bsp）里**自带完整同芯片驱动**
+（`bsp/drivers/net/wireless/aic8800/`，比 DKMS 版更新：带芯片接口 choice、btusb、
+aic8800p_fdrv），`device-a527` 的 `bsp_defconfig` 也启用了它
+（`AIC_WLAN_SUPPORT=y, AIC8800_WLAN_SUPPORT=m, AIC8800_BTLPM_SUPPORT=m`）。
 
-源码树里还自带 `for_Allwinner/A133/.../driver/net/wireless/aic8800/` 等
-**in-tree 移植示例**，证明这条路线有官方先例。要做的只是：
+**但 radxa.config 第 1113 行显式 `CONFIG_AIC_WLAN_SUPPORT=n`**——Radxa 官方选择禁用
+树内副本、走 DKMS 分发（Debian 根文件系统里实测只有 DKMS 产物，没有 bsp 副本的 .ko）。
+注意 bsp 版驱动的固件接口不同：按 `aic8800d80/xxx.bin` 相对名 request_firmware，
+需要另一套固件布局 + 未随 Debian 分发的 `aichw.conf`，**不要换用**。
 
-1. `patches/` 加 patch：把 `driver/aic8800/`（3 个子目录）+ Kconfig 接线
-   注入内核树 `drivers/net/wireless/aic8800/`；
-2. fragment 追加 `CONFIG_AIC_WLAN_SUPPORT=y` 等（连同
-   `CONFIG_CFG80211=y` / `CONFIG_MAC80211=y`——这两个是树内的，和 bridge 一样直接 builtin）。
+### 3.2 实际实施方案（已落地，feature/aic8800-builtin）
 
-**要认账的代价**：
+以板上验证过的 DKMS 5.0+git20260123 源码为基准，清洗移植进内核树：
 
-- 固件**仍然要拷**（见 §2.2），builtin 不解决这个问题；
-- fdrv 是 RivieraWaves 全 MAC 驱动，源码体量大，patch 塞新文件不优雅——
-  实际做法：源码 tarball 走 release 附件/LFS，`build.sh` 下载后只 git apply 接线小 patch；
-- 内核跟随上游 aw2607 升级时，这个 out-of-tree 驱动要跟着验（锁 6.6 期间风险低，
-  但仓库性质从"配置包装"变成"养一个驱动移植"）。
+1. **`vendor/aic8800/`**（140 文件 4.5MB，`scripts/vendor-aic8800.sh` 生成）：
+   - 删除 DKMS 外部编译 cruft（Platform ifeq、`all/modules/install` 等显式目标
+     ——与 kbuild 全局目标重名会覆盖 `modules` 规则）；
+   - **符号隔离**：Kconfig 符号改名 `AICV_*`，避免与 bsp 副本的开关互相干扰
+     （源码不引用这些宏，全量 grep 验证过；`AIC_FW_PATH` 例外——源码直接引用
+     其 C 宏且 bsp 树无此符号，保留原名，autoconf 直接生成）；
+   - **同名内部符号去重**（builtin 的关键障碍）：DKMS 双模块架构里 bsp/fdrv
+     各带一份私有同名副本（md5、SDIO 传输层、cmd 助手、全局变量，nm 实测 54 个），
+     做模块互不冲突，builtin 进同一 vmlinux 会 multiple definition。
+     经 nm 全量核实未定义引用均为模块内自包含后，bsp 侧 54 个符号统一
+     `ccflags-y += -D原名=aicv_bsp_原名`（源码级改名，定义与引用一致改写），
+     fdrv 侧保持原名，两模块私有副本语义原样保留。
+2. **`patches/0001-aic8800-kbuild-wiring.patch`**：`drivers/net/wireless/` 的
+   Kconfig（endif # WLAN 前 source）与 Makefile（obj-$(CONFIG_AICV_WLAN_SUPPORT)）接线。
+3. **fragment**：`CFG80211=y / MAC80211=y / AICV_*=y / AIC_WLAN_SUPPORT=n /
+   AIC_FW_PATH="/lib/firmware/aic8800_fw/SDIO/aic8800D80"`。
+4. **verify.sh 新增**：模块目录无 `aic*.ko` 残留 + vmlinux 符号抽查
+   （`aicbsp_init` / `aicwf_sdio_bus_init` / `aicv_bsp_*`）。
 
-## 4. 当前 OpenWrt 镜像的缺口（3 个）
+本地 16 核全量构建通过，verify.sh 全绿；vmlinux 内同时存在 fdrv 原名符号
+与 bsp 改名符号，链接语义与双模块运行时一致。
 
-对照本仓库 Actions 产物（`modules-and-dtb.tar`）与 image 仓
-（`radxa-a5e-openwrt`）流水线实测：
+## 4. 镜像缺口（内核侧已清零，只剩固件分发）
 
-1. **kernel-actions 产物里没有 aic8800 模块**——内核树不含此驱动，
-   `lib/modules/<KVER>/updates/dkms/` 整个不存在，`modules.dep` 无 aic 条目；
-2. **镜像里没有固件**——`custom/rootfs` 与 armsr rootfs 的 `/lib/firmware/` 为空；
-3. **cfg80211/mac80211 是 `.ko` 模块**——已展开可手动加载，但走
-   kmodloader/hotplug 自动加载有和 bridge 同源的依赖解析风险
-   （《A5E-内核编译-记录.md》坑 8；文档内 TODO 已留 wireless builtin）。
+对照本仓库产物与 image 仓（`radxa-a5e-openwrt`）流水线实测：
+
+1. ~~kernel 产物里没有 aic8800 模块~~ **✅ 已根治**：驱动整体 builtin，
+   模块目录无任何 `aic*.ko`（bsp/fdrv 进 vmlinux）；
+2. ~~cfg80211/mac80211 是 `.ko` 模块~~ **✅ 已根治**：随 fragment `=y` builtin；
+3. **⬜ 镜像里没有固件**——`custom/rootfs` 与 armsr rootfs 的 `/lib/firmware/` 为空，
+   需要 image 仓把 `aic8800_fw/SDIO/aic8800D80/` 拷进 `/lib/firmware/`
+   （板上实测驱动读的是 `CONFIG_AIC_FW_PATH` 目录下的
+   `fmacfw_8800d80_u02.bin` 等，见 §5 记录）。
 
 用户态**无缺口**：armsr rootfs 自带 `wpad`/`hostapd`/`wpa_supplicant`、
 `iwinfo` 库与 netifd 无线支持；缺 `iw` CLI（调试可选，可用 `iwinfo` 替代）。
@@ -160,21 +174,31 @@ lib/modules/6.6.98-1-aw2607/updates/dkms/
 lib/firmware/aic8800_fw/SDIO/aic8800/   ← 先按 §2.3 对齐后的结论拷
 ```
 
-板上验证清单：
+板上验证清单（2026-10-06 **全部完成，WiFi 点亮**）：
 
-- [ ] `insmod aic8800_bsp_sdio.ko && insmod aic8800_fdrv_sdio.ko`（顺序）
-- [ ] `dmesg | grep -i -E "aic|firmware"`：确认 request 的固件名/路径，**修正 §2.3 的目录结论**
-- [ ] `ip link` 出现 wlan 口；`iwinfo` 能扫到 AP
-- [ ] uci 生成 `/etc/config/wireless`，hostapd 能起 AP / 连 STA
+- [x] `insmod aic8800_bsp_sdio.ko && insmod aic8800_fdrv_sdio.ko`（顺序）——成功；
+      **注意 cfg80211/mac80211 当时还是模块，需先 insmod，否则 fdrv 报
+      Unknown symbol（builtin 后此问题自然消失）**
+- [x] `dmesg` 实测固件路径 = **`/lib/firmware/aic8800_fw/SDIO/aic8800D80/fmacfw_8800d80_u02.bin`**
+      ——§2.3 疑点解决：芯片是 D80 变体，硬编码路径正确；
+      固件是 **filp_open 直读**（`CONFIG_USE_FW_REQUEST=n`），不是 request_firmware
+- [x] `ip link` 出现 `wlan0`；`iw dev wlan0 scan` 扫到周边 AP（信号正常）；
+      芯片 HT/VHT/HE 全支持（WiFi6），**实际 2.4G 单频**（uci 自动配置的 5g/ch36 是误判，需手改 2g）
+- [x] 手工 hostapd 起 AP：**AP-ENABLED 成功**，SSID 可广播
+- [ ] uci/netifd 自动配 AP（`wifi up`）：**卡 `command failed: Not supported (-95)`**，
+      纯软件集成问题，netifd/wifi-scripts 对 fullmac 驱动的兼容，待单独排查
 
-### 第二步：根治（验证通过后二选一）
+### 第二步：根治 ✅ 已完成（走了方案 B 的改进版）
 
-- **方案 A（推荐，与"只做一件事"哲学兼容）**：image 仓加 `45-wireless.sh`——
-  从 Debian 资产拷预编译 `.ko` + 固件 + depmod；kernel 仓 fragment 追加
-  `CONFIG_CFG80211=y`/`CONFIG_MAC80211=y` 让依赖栈 builtin。
-  改动小、零编译风险；aic8800 本体走 `/etc/modules.d/` 显式加载，不赌 hotplug。
-- **方案 B（最彻底，维护成本高）**：按 §3 把 aic8800 vendor 进内核树 builtin，
-  板上 `lsmod` 看不到它，和 bridge 同待遇。固件拷贝依旧需要（方案 A/B 都要）。
+按 §3.2 落地：vendor 进内核树 builtin（方案 B），但用**板上验证过的 DKMS 源码**
+而非 bsp 副本，并用符号隔离 + 54 个内部符号改名解决双模块私有副本的 builtin
+链接障碍。本地全量构建 + verify.sh 全绿。
+
+**剩余工作**：
+1. 用新内核 + 固件组装镜像烧录，板上复验（wlan0 应开机自动出现，无需任何 insmod）；
+2. image 仓（radxa-a5e-openwrt）加固件分发步骤（`aic8800_fw/SDIO/aic8800D80/` →
+   `/lib/firmware/`）；aic8800 模块注入步骤**不再需要**；
+3. uci/netifd `-95` 问题单独排查（见 §5 清单最后一项）。
 
 ### 文档同步
 
@@ -183,10 +207,12 @@ lib/firmware/aic8800_fw/SDIO/aic8800/   ← 先按 §2.3 对齐后的结论拷
 
 ## 6. 待验证问题清单
 
-| # | 问题 | 验证方式 |
+| # | 问题 | 状态/结论 |
 |---|---|---|
-| 1 | 固件到底 request 哪个目录/哪些文件（§2.3 的硬编码路径 vs 裸名矛盾） | 第一步板上 `dmesg` |
-| 2 | btlpm（蓝牙）是否必须加载 WiFi 才工作 | 第一步跳过 btlpm 试 |
-| 3 | hotplug 自动加载修复后的 `.ko` 是否可靠（kmodloader 同源风险） | 第一步 reboot 后不手动 insmod 观察 |
-| 4 | builtin 化时 `CONFIG_AIC_FW_PATH` 要不要改指向 `SDIO/aic8800/` | 由问题 1 的结论决定 |
-| 5 | OpenWrt 下 `rwnx_settings.ini` 等 modinfo 声明的固件是否真被 request（可能只是声明） | dmesg request 日志 |
+| 1 | 固件目录/加载方式 | ✅ D80 子目录 + filp_open 直读（§5 记录） |
+| 2 | btlpm（蓝牙）是否必须 | ✅ 跳过 btlpm WiFi 正常工作；btlpm 未编进 builtin 内核 |
+| 3 | hotplug/kmodloader 自动加载 | ✅ 不再需要——驱动 builtin，开机即在场 |
+| 4 | AIC_FW_PATH 指向 | ✅ `/lib/firmware/aic8800_fw/SDIO/aic8800D80`（已固化在 fragment） |
+| 5 | modinfo 声明的固件 | ✅ 实际只读 `fmacfw_8800d80_u02.bin` 等 D80 文件，无 request_firmware |
+| 6 | builtin 内核板上复验（wlan0 自动出现、hostapd 可用） | ⬜ 待烧录新镜像验证 |
+| 7 | uci/netifd `wifi up` 的 `-95`（fullmac 兼容） | ⬜ 待排查（不影响手工 hostapd） |
