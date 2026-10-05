@@ -80,10 +80,17 @@ out/
 
 **自动触发**：
 - push 到 `main` 且改动了 `configs/**` / `patches/**` / `scripts/**` / workflow 文件
-- 打 `v*` tag 会额外把产物 attach 到 GitHub Release
 
-**预计耗时**：单跑一次全量 ~15-25 分钟（Actions 的 ubuntu-24.04 是 4 核）；
-本地 16 核机器 ~8-10 分钟。
+**Release 发布**（build 成功即发）：
+- push main / dispatch → 滚动 **prerelease `dev-build`**（每次覆盖产物、`target` 移到最新 commit，下载它永远是最新 main 构建）
+- 打 `v*` tag → **正式 release**（用 tag 名）
+
+产物可从 Actions artifact（`a5e-kernel-<run>`）或 release 的 asset 下载：
+`vmlinuz-*`、`modules-and-dtb.tar`（已处理好的 .ko + dtb）、`linux-image-*.deb`、`sha256sums.txt`、`BUILD_INFO.env`。
+
+**环境/耗时**：job 跑在 `container: debian:bookworm`（同本地 devcontainer，避免 Ubuntu
+24.04 的 deb822 源缺 arm64 URIs）；apt 强制 `ForceIPv4`（Actions 走 IPv6 拉不到源）；
+全量编译 ~15-25 分钟，改 scripts/config 走增量（已编译 objects 有 `save-always` cache）。
 
 ## 已验证的下游集成
 
@@ -99,19 +106,22 @@ p3 里即可（分区 LBA 679936 / 488MB ext4）。参考 `docs/A5E-内核编译
   阶段处理，不能通过配置绕过
 - `deb` 里的 `vmlinuz` 是 gzip 格式（Debian 打包惯例），U-Boot extlinux 需要**未压缩**
   Image —— 所以 post-process 从 `arch/arm64/boot/Image` 单独取
-- host 工具（`extract-cert` 等）用交叉编译器编译（Makefile.extra 的 `HOSTCC=$(CROSS_COMPILE)gcc`），
-  依赖 `libssl-dev:arm64`（**不是** `libssl-dev`）—— Actions 里已处理，本地跑要注意
+- host 工具（`extract-cert`/`fixdep` 等）：Makefile.extra 原本 `HOSTCC=$(CROSS_COMPILE)gcc`，
+  Actions container 无 binfmt_misc 会 `Exec format error`。**build.sh 已自动 `sed` 成 `HOSTCC=gcc`**
+  （host 工具用 host gcc），target 内核仍交叉编译。本地有 binfmt 时两种都行。
 
-## Fragment 当前覆盖的 CONFIG（36 行）
+## Fragment 当前覆盖的 CONFIG（49 行）
 
-分组：
+> 完整以 `configs/a5e-openwrt.config` 为准；下列按组概略。
+
 - **bridge**：`BRIDGE`, `BRIDGE_NETFILTER`（自动 select `LLC`/`STP`）
 - **fw4 core**：`NF_TABLES`, `NF_CONNTRACK`, `NF_NAT`, `NF_NAT_MASQUERADE`, `NF_NAT_REDIRECT`
-- **nft expressions**：`NFT_CT/LIMIT/LOG/MASQ/NAT/REDIR/REJECT/COMPAT/FIB_INET/SOCKET/FLOW_OFFLOAD`
-- **bridge netfilter**：`NFT_BRIDGE_META`, `NFT_BRIDGE_REJECT`
-- **透明代理（tproxy）**：`NFT_TPROXY`, `NF_TPROXY_IPV4/IPV6`, `NF_SOCKET_IPV4/IPV6`,
-  `NETFILTER_XT_TARGET_TPROXY/REDIRECT`, `NETFILTER_XT_MATCH_SOCKET`, `NF_DUP_IPV4/IPV6/NETDEV`
-- **支撑**：`NF_DEFRAG_IPV4/IPV6`, `NF_LOG_SYSLOG`, `NF_FLOW_TABLE`, `NF_FLOW_TABLE_INET`
+- **nft expressions**：`NFT_CT/LIMIT/LOG/MASQ/NAT/REDIR/REJECT/COMPAT/SOCKET/FLOW_OFFLOAD`
+- **fib**：`NFT_FIB`(父) + `NFT_FIB_INET/IPV4/IPV6/NETDEV`
+- **桥 netfilter**：`NF_TABLES_BRIDGE`(父 menuconfig) + `NFT_BRIDGE_META` + `NFT_BRIDGE_REJECT` + `NF_REJECT_IPV4/6`
+- **透明代理**：`NFT_TPROXY` + `NF_TPROXY_IPV4/6` + `NF_SOCKET_IPV4/6` + `NF_DUP_IPV4/6/NETDEV`
+- **iptables 兼容层**（xt_tproxy 依赖）：`NETFILTER_XTABLES` + `IP_NF_IPTABLES/IP6_NF_IPTABLES/IP_NF_NAT/IP_NF_MANGLE` + `NETFILTER_XT_TARGET_TPROXY/REDIRECT` + `NETFILTER_XT_MATCH_SOCKET`
+- **支撑**：`NF_DEFRAG_IPV4/6`, `NF_LOG_SYSLOG`, `NF_FLOW_TABLE`, `NF_FLOW_TABLE_INET`
 
 ## 相关文档
 

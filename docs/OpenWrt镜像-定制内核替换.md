@@ -24,9 +24,20 @@
 **拿产物的三种方式**：
 
 ```bash
-# 方式 A：跑 Actions，下载 artifact（推荐，产出即上面 out/ 结构）
-#   仓库页 Actions → Build A5E OpenWrt Kernel → 最新成功 run → Artifacts 里
-#   a5e-kernel-<run>  → 解压得到 out/{vmlinuz,root/lib/modules,root/usr/lib/linux-image-*}
+# 方式 A：跑 Actions 下载产物。两种取法，产出都是 out/ 结构：
+#   A1) artifact：仓库页 Actions → 最新成功 run → a5e-kernel-<run> → 解压得
+#       out/{vmlinuz,root/lib/modules,root/usr/lib/linux-image-*}
+#   A2) release（更顺手：push main 会自动刷新滚动 prerelease “dev-build”）：
+       mkdir -p ci-kernel && cd ci-kernel
+       BASE=https://github.com/<owner>/radxa-a5e-openwrt-kernel/releases/download/dev-build
+       curl -sLO $BASE/vmlinuz-6.6.98-1-aw2607
+       curl -sLO $BASE/modules-and-dtb.tar
+       curl -sLO $BASE/sha256sums.txt
+       sha256sum vmlinuz-6.6.98-1-aw2607          # 对 sha256sums.txt 里 vmlinuz 行，防下载损坏
+       # 重组 out/：tar 里是 root/lib/modules + root/usr/lib/linux-image-*（都是已处理好的 .ko/.dtb）
+       mkdir -p out && tar -xf modules-and-dtb.tar -C out
+       cp vmlinuz-6.6.98-1-aw2607 out/vmlinuz
+       # 校验齐全：out/vmlinuz + out/root/lib/modules/<KVER>/*.ko + a5e dtb
 
 # 方式 B：本地跑编译仓库脚本（产出同样 out/ 结构）
 cd radxa-a5e-openwrt-kernel
@@ -217,6 +228,14 @@ debugfs -R "stat /etc/init.d/bridge-modules" /tmp/verify.img 2>&1 | grep -q "not
 # 其它固化配置没被动
 debugfs -R "cat /etc/config/firewall" /tmp/verify.img 2>/dev/null | grep -c "Allow-SSH-WAN"
 debugfs -R "cat /boot/extlinux/extlinux.conf" /tmp/verify.img 2>/dev/null | grep -o "coherent_pool=2M"
+
+# 【关键】root=UUID 必须等于 p3 实际 superblock UUID（启动能否挂载的命脉）
+#   注意：每次 rsdk build-image 重生镜像 mkfs.ext4 会随机新 UUID，别照搬旧文档里的值！
+SUP=$(debugfs -R "show_super_stats -h" /tmp/verify.img 2>/dev/null | awk '/Filesystem UUID/{print $3}')
+ROOT=$(debugfs -R "cat /boot/extlinux/extlinux.conf" /tmp/verify.img 2>/dev/null | grep -oE 'root=UUID=[0-9a-f-]+' | cut -d= -f2-)
+echo "superblock UUID = $SUP"
+echo "extlinux  root=  = $ROOT"
+[ "$SUP" = "$ROOT" ] && echo "✓ 一致，能挂载 rootfs" || echo "✗ 不一致！需同步 extlinux 的 root=UUID"
 rm -f /tmp/verify.img
 ```
 
@@ -245,9 +264,31 @@ ssh -o StrictHostKeyChecking=no root@$IP '
 ```
 
 判据（全绿即成功）：
-- `/proc/modules` **无** `bridge`，`/sys/module/bridge` **存在** → bridge 进了 vmlinux
+- `/proc/modules` **无** `bridge` → bridge 进了 vmlinux
 - `/etc/init.d/bridge-modules` **不存在** → 不再依赖 workaround
 - `br-lan` 自动 `state UP` + `192.168.1.1` + `eth0 master br-lan` → LAN 开箱可用
+
+### 8b. 防火墙验收（只有 fw4 也 builtin 的完整版才看得到；bridge-only 版会暴露"裸奔"）
+
+```bash
+ssh -o StrictHostKeyChecking=no root@$IP '
+  nft list ruleset 2>&1 | head -3                         # 期望列出 table inet fw4（不是 cache init failed）
+  nft list chain inet fw4 input 2>&1 | grep -oE "policy (drop|accept)"  # 期望 drop
+  nft list chain inet fw4 input_wan 2>&1 | grep -E "Allow-SSH-WAN|Allow-LuCI-WAN"
+  logread 2>/dev/null | grep -iE "cache init|Unable to parse nftables" | tail   # 期望空
+'
+```
+
+判据：`nft list ruleset` 能列出完整 `inet fw4` + `input` 链 `policy drop` +
+`input_wan` 里 `Allow-SSH-WAN` 带 **counter packets>0**（规则真进内核并在匹配流量）。
+
+> **两个易误判的认知纠正（实测踩到）**：
+> - `/etc/init.d/firewall status` 显示 **`active with no instances`** 是**正常**的——fw4 是
+>   reload 型服务，下发完规则不常驻 instance。别当成"防火墙没跑"；真判据是 `nft list ruleset`。
+> - `ls /sys/module/<X>` 对 **bool** 内建项（`nf_tables`/`nf_socket_*`）**不存在**是正常的
+>   （bool 不建模块 sysfs）；只有 tristate 内建（`bridge`）才在 `/sys/module`。
+> - 之前 bridge-only 版"SSH 能连"是假象（nf_tables 没进内核→fw4 零规则→端口全裸奔）；
+>   完整版是在 `policy drop` 下靠 `Allow-SSH-WAN` 精确放行。
 
 ---
 

@@ -306,6 +306,22 @@ OpenWrt 的 kmodloader/busybox 无 xz 解压 → 必须批量转 `.ko`（详见 
 
 所以不需要额外 sed 移除对 bridge/stp/llc 的依赖引用 —— **改一行 config 就够了**。
 
+### CI 实跑（GitHub Actions）额外踩的 7 个坑（本仓库已逐项修入）
+
+> 这些是“本地能跑→ Actions 挂”的环境差异，本地 devcontainer 有 root+binfmt+IPv4 都并不上。
+
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| F | `apt-get install` 挂 / 拉不到包 | Actions 走 IPv6 部分节点不通报 `deb.debian.org` | `apt -o Acquire::Retries=5 -o Acquire::ForceIPv4=true`；job 用 `container: debian:bookworm`（同本地）而非 ubuntu |
+| G | `fixdep: Exec format error`，make 在 scripts_basic 挂 | Radxa `Makefile.extra` 写 `HOSTCC=$(CROSS_COMPILE)gcc` → host 工具编成 aarch64；Actions container 无 `--privileged`→无 binfmt_misc 跑不了 | `build.sh` 里 `sed 's/HOSTCC=$(CROSS_COMPILE)gcc/HOSTCC=gcc/' Makefile.extra`（host 工具用 host gcc，target 仍交叉） |
+| H | post-process `模块目录不存在: …_6.6.98-1` | deb 名 `<pkg>_<ver>_<arch>`，`sed 's/_arm64.deb//'` 只剔尾不剔中间版本段 | 先 `dpkg-deb -x` 再从 `lib/modules/` 目录名读 KVER |
+| I | verify 报 `nf_socket_ipv4.ko ✗` | `CONFIG_NF_SOCKET_*` 是 bool，内建但不进 `modules.builtin` | 主判据改读 `boot/config-<KVER>` 确认 `=y`（bool/tristate 通吃）+ 从 fragment 动态取列表 |
+| J | 独立 collect metadata step 反复 exit 1 | step-env `inputs.kernel_ref` 在 push 事件渲染怪异（即便去掉 set -u 仍挂） | 删独立 step，BUILD_INFO 并入 post-process，用 `GITHUB_*`+`:-` 兜底 |
+| K | push 不生成 release | release job `if: startsWith(github.ref,'refs/tags/v')` 只认 tag | 改 `if: needs.build.result=='success'`；push/dispatch → 滚动 prerelease `dev-build`，tag → 正式 |
+| L | release publish 报 `not a git repository` | release job 没 checkout，`gh` 靠 git remote 推仓库 | 给 publish step 设 `env: GH_REPO: ${{ github.repository }}` |
+
+> 另：fork 上游到 `yzxiu/linux-aw2607` + cache key 纳入 `scripts/**`，避免上游强推/换源导致旧 clone 误复用。
+
 ---
 
 ## 6. 产物后处理（把 deb 变成能装进 OpenWrt 的东西）
