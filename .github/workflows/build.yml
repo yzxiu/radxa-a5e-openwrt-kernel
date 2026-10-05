@@ -1,0 +1,202 @@
+name: Build A5E OpenWrt Kernel
+
+# 触发方式：
+#   1) 手动 dispatch：可选填 kernel_ref（上游 linux-aw2607 的分支/tag/sha），
+#      不填默认 main
+#   2) push：改 configs/** / patches/** / scripts/** / workflow 时自动构建
+#   3) 打 v* tag：release job 会把产物 attach 到 GitHub Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_ref:
+        description: 'linux-aw2607 ref (branch / tag / sha)'
+        required: false
+        default: 'main'
+  push:
+    branches: [main]
+    paths:
+      - 'configs/**'
+      - 'patches/**'
+      - 'scripts/**'
+      - '.github/workflows/build.yml'
+  create:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  # 上游构建逻辑（debian/patches、Makefile.extra、submodule pin 的 sha）锁定到 fork；
+  # 防 radxa-pkg 强推 / 改构建方式把 Actions 打挂。submodule 仍按本仓库 pin 的
+  # commit sha checkout，即使 radxa 移动 branch 也不受影响。
+  KERNEL_URL: https://github.com/yzxiu/linux-aw2607.git
+  DEBIAN_FRONTEND: noninteractive
+
+jobs:
+  build:
+    name: build (kernel ${{ inputs.kernel_ref || 'main' }})
+    runs-on: ubuntu-24.04
+    # 与本地 rsdk devcontainer 同款 Debian 12（bookworm），
+    # 避免 Ubuntu 24.04 deb822 sources 里 arm64 URIs 缺失导致的
+    # `crossbuild-essential-arm64` / `libssl-dev:arm64` 装不上问题。
+    container:
+      image: debian:bookworm
+    timeout-minutes: 75
+    steps:
+      - name: show apt/env (方便日志定位)
+        run: |
+          set -x
+          dpkg --print-architecture
+          dpkg --print-foreign-architectures
+          echo "--- sources ---"
+          cat /etc/apt/sources.list.d/*.sources 2>/dev/null || true
+          cat /etc/apt/sources.list 2>/dev/null || true
+          echo "--- policy ---"
+          apt-cache policy | head -20
+
+      - name: apt base + ca-certificates
+        run: |
+          set -x
+          apt-get update -o Acquire::Retries=5 -o Acquire::ForceIPv4=true 2>&1 | tee /tmp/apt-update.log | tail -20
+          apt-get install -y --no-install-recommends ca-certificates git xz-utils 2>&1 | tee /tmp/apt-base.log | tail -10
+          if [ ! -x /usr/bin/git ]; then
+            echo "::error::git 没装上，失败！"
+            cat /tmp/apt-update.log /tmp/apt-base.log
+            tail -80 /var/log/apt/term.log 2>/dev/null || true
+            exit 1
+          fi
+
+      - name: enable arm64 arch
+        run: |
+          set -x
+          dpkg --add-architecture arm64
+          apt-get update -o Acquire::Retries=5 -o Acquire::ForceIPv4=true 2>&1 | tail -20
+
+      - name: apt host toolchain (amd64) + cross compiler (arm64)
+        run: |
+          set -x
+          apt-get install -y --no-install-recommends \
+            build-essential bc bison flex rsync cpio kmod \
+            libssl-dev libncurses-dev libelf-dev \
+            dpkg-dev debhelper \
+            crossbuild-essential-arm64 \
+            qemu-user-static binfmt-support 2>&1 | tail -30
+          command -v aarch64-linux-gnu-gcc || { echo "::error::交叉编译器没装上"; exit 1; }
+
+      - name: apt libssl-dev:arm64 (host tools 用交叉编译器编译 extract-cert 需要)
+        run: |
+          set -x
+          apt-get install -y --no-install-recommends libssl-dev:arm64 2>&1 | tail -10
+          ls -l /usr/include/aarch64-linux-gnu/openssl/opensslconf.h
+
+      # checkout 之前先把 git safe.directory 配好（Actions workspace 的 uid 与容器 root 不同）
+      - name: allow git in workspace
+        run: git config --system --add safe.directory '*'
+
+      - name: checkout this repo
+        uses: actions/checkout@v4
+
+      - name: cache linux-aw2607 source (submodule)
+        uses: actions/cache@v4
+        with:
+          path: kernel
+          # cache key 由本仓库配置 + 上游 ref + scripts 共同决定。
+          # 加入 scripts/**：URL/构建脚本改动会让 key 变，强制重建，
+          # 避免 fork 后 commit sha 与上游相同导致旧 clone 被误复用、改了等于没改。
+          key: kernel-src-${{ inputs.kernel_ref || 'main' }}-${{ hashFiles('configs/**', 'patches/**', 'scripts/**') }}
+          restore-keys: |
+            kernel-src-${{ inputs.kernel_ref || 'main' }}-
+            kernel-src-main-
+
+      - name: build kernel (clone + patch + fragment + make)
+        env:
+          KERNEL_REF: ${{ inputs.kernel_ref || 'main' }}
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/build.sh
+
+      - name: post-process (.ko.xz → .ko, plain Image, sha256)
+        run: ./scripts/post-process.sh
+
+      - name: verify (bridge + fw4 + tproxy 都进 vmlinux)
+        run: ./scripts/verify.sh
+
+      - name: collect artifact metadata
+        env:
+          KERNEL_REF: ${{ inputs.kernel_ref || 'main' }}
+        run: |
+          set -euo pipefail
+          KVER=$(ls out/root/lib/modules/)
+          {
+            echo "kernel_version=$KVER"
+            echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            echo "run_id=${{ github.run_id }}"
+            echo "run_url=https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+            echo "commit=${{ github.sha }}"
+            echo "source_ref=$KERNEL_REF"
+          } > out/BUILD_INFO.env
+          cat out/BUILD_INFO.env
+
+      - name: upload artifact — full prepared bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: a5e-kernel-${{ github.run_number }}
+          path: |
+            out/linux-image-*.deb
+            out/linux-headers-*.deb
+            out/linux-libc-dev-*.deb
+            out/vmlinuz
+            out/root/lib/modules/
+            out/root/usr/lib/linux-image-*/
+            out/sha256sums.txt
+            out/BUILD_INFO.env
+          retention-days: 60
+          if-no-files-found: error
+
+  # 打了 v* tag 时把产物 attach 到 GitHub Release
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-24.04
+    steps:
+      - name: download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: a5e-kernel-${{ github.run_number }}
+          path: bundle/
+
+      - name: flatten (把 vmlinuz / deb / sha256 提到顶层方便 release)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          cp bundle/linux-image-*.deb dist/
+          cp bundle/linux-headers-*.deb dist/ 2>/dev/null || true
+          cp bundle/linux-libc-dev_*.deb dist/ 2>/dev/null || true
+          KVER=$(ls bundle/root/lib/modules/)
+          cp bundle/vmlinuz "dist/vmlinuz-$KVER"
+          cp bundle/sha256sums.txt dist/
+          cp bundle/BUILD_INFO.env dist/
+          tar -C bundle -cf dist/modules-and-dtb.tar \
+            "root/lib/modules" "root/usr/lib/linux-image-$KVER"
+          ls -lh dist/
+
+      - name: gh release upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --verify-tag \
+            --title "A5E kernel ${{ github.ref_name }}" \
+            --notes "**Automated build** from commit \`${{ github.sha }}\`
+
+          产物：
+          - \`linux-image-*.deb\` — bridge / firewall4 / tproxy 已 builtin（进 vmlinux，不再走 modprobe）
+          - \`vmlinuz-*\` — **未压缩** ARM64 Image，U-Boot extlinux 直接可用
+          - \`modules-and-dtb.tar\` — 处理后的 \`/lib/modules/\` 和 \`/usr/lib/linux-image-*/\`
+            · \`.ko.xz\` 全部展开成 \`.ko\`
+            · \`modules.dep\` 等元数据里的 \`.ko.xz\` 路径已 sed 成 \`.ko\`
+            · \`.bin\` 缓存已删除（OpenWrt kmodloader 无 xz、无 bin 支持）
+          - \`sha256sums.txt\` — 校验和" \
+            dist/*

@@ -1,0 +1,28 @@
+# 构建工作目录（本仓库脚本产生，不入库）
+kernel/
+out/
+dist/
+
+# 常见编译残留
+*.o
+*.o.d
+*.ko
+*.mod
+*.mod.c
+.tmp_versions/
+modules.order
+Module.symvers
+
+# 打包产物
+*.deb
+*.changes
+*.buildinfo
+
+# 编辑器
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
