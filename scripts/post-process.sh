@@ -21,13 +21,18 @@ OUT_DIR="${OUT_DIR:-$REPO_DIR/out}"
 DEB=$(ls "$OUT_DIR"/linux-image-*_arm64.deb | head -1)
 [ -n "$DEB" ] || { echo "找不到 linux-image-*.deb，先跑 build.sh"; exit 1; }
 
-KVER=$(basename "$DEB" | sed -E 's/^linux-image-//; s/_arm64\.deb$//')
-echo "内核版本字符串: $KVER"
-
 echo "=== [1/5] extract deb → $OUT_DIR/root/ ==="
 rm -rf "$OUT_DIR/root"
 mkdir -p "$OUT_DIR/root"
 dpkg-deb -x "$DEB" "$OUT_DIR/root/"
+
+# KVER 以解压出的 lib/modules 目录名为准。
+# deb 文件名是 Debian 的 <pkg>_<upstreamver>_<arch>.deb 格式，
+# 下划线把 version 段隔开了，纯靠文件名 sed 很容易漏剔（例如误得
+# "6.6.98-1-aw2607_6.6.98-1"），而真实模块目录只到 KERNELRELEASE。
+KVER=$(ls "$OUT_DIR/root/lib/modules/" 2>/dev/null | head -1)
+[ -n "$KVER" ] || { echo "解压后找不到 lib/modules 子目录"; exit 1; }
+echo "内核版本字符串 (取自 lib/modules): $KVER"
 
 echo "=== [2/5] convert .ko.xz → .ko ==="
 MODDIR="$OUT_DIR/root/lib/modules/$KVER"
