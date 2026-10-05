@@ -109,6 +109,8 @@ jobs:
           restore-keys: |
             kernel-src-${{ inputs.kernel_ref || 'main' }}-
             kernel-src-main-
+          # 即使后续步骤失败也保存已编译 objects，下次命中增量（省 25 分钟全量重编）
+          save-always: true
 
       - name: build kernel (clone + patch + fragment + make)
         env:
@@ -127,8 +129,11 @@ jobs:
         env:
           KERNEL_REF: ${{ inputs.kernel_ref || 'main' }}
         run: |
-          set -euo pipefail
+          set -eo pipefail
           KVER=$(ls out/root/lib/modules/)
+          # push 事件无 inputs 上下文，step-env 的 inputs.kernel_ref 可能渲染为空；
+          # 去掉 set -u + 裸 $KERNEL_REF（会 unbound 导致本步 exit 1），显式兜底。
+          KERNEL_REF="${KERNEL_REF:-main}"
           {
             echo "kernel_version=$KVER"
             echo "built_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
