@@ -129,8 +129,10 @@ p3 里即可（分区 LBA 679936 / 488MB ext4）。参考 `docs/A5E-内核编译
 - **无线（AIC8800 builtin）**：`WLAN`, `CFG80211`, `MAC80211`（依赖栈）+
   `AICV_WLAN_SUPPORT`, `AICV8800_WLAN_SUPPORT`（vendor/aic8800 移植版，符号隔离自 bsp 自带副本），
   `AIC_WLAN_SUPPORT=n`（保持 Radxa 对 bsp 副本的禁用），
-  `AIC_FW_PATH="/lib/firmware/aic8800_fw/SDIO/aic8800D80"`（板上实测固件路径）
-  详见 `docs/A5E-WiFi驱动-AIC8800-调研.md`
+  `AIC_FW_PATH="/lib/firmware/aic8800_fw/SDIO/aic8800D80"`（板上实测固件路径，驱动 filp_open 直读）
+- 初始化走**异步内核线程**（轮询真 rootfs 就绪后再起）——在 initcall 里同步做会卡死启动，
+  三轮板验对照见 `docs/A5E-WiFi驱动-AIC8800-调研.md` §5 第三步；
+  用户态还需禁用 wpad 降权（§5 第四步），镜像侧待办清单见 §7
 
 ## 相关文档
 
