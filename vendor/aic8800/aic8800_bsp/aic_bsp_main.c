@@ -469,7 +469,7 @@ static void __exit aicbsp_exit(void)
 	printk("%s\n", __func__);
 }
 
-module_init(aicbsp_init);
+late_initcall(aicbsp_init);
 module_exit(aicbsp_exit);
 
 MODULE_DESCRIPTION(DRV_DESCRIPTION);

@@ -87,6 +87,15 @@ find "$DST" -name 'Kconfig*' -exec sed -i \
   -e 's/\bAIC_WLAN_SUPPORT\b/AICV_WLAN_SUPPORT/g' \
   {} +
 
+# ---- 初始化时机：device_initcall → late_initcall ----
+# builtin 时 aic 的 module_init 在 0.34s 就执行，早于 PMIC(axp2202) 稳压器、
+# sunxi-rfkill（~3.1s）、mmc2/sdio 枚举等基础设施，aicbsp_platform_power_on 必失败
+# （板上实测：fail to set AIC_WIFI power state to 1）。模块方案没这问题纯粹因为
+# insmod 时基础设施早已就绪。改成 late_initcall 等它们全部就位。
+# 注意：本移植只用于 builtin，此改动对模块构建不适用（也不需要）。
+sed -i 's/^module_init(aicbsp_init);/late_initcall(aicbsp_init);/' "$DST/aic8800_bsp/aic_bsp_main.c"
+sed -i 's/^module_init(rwnx_mod_init);/late_initcall(rwnx_mod_init);/' "$DST/aic8800_fdrv/rwnx_main.c"
+
 # ---- bsp 侧同名内部符号去重（builtin 必需）----
 # DKMS 双模块架构里 bsp/fdrv 各自带一份私有同名副本（md5、SDIO 传输层、cmd 助手、
 # 全局变量），做成模块互不冲突，但 builtin 进同一 vmlinux 会 multiple definition。
