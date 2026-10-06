@@ -16,9 +16,13 @@
 ├── .github/workflows/build.yml   # Actions 主入口
 ├── configs/
 │   └── a5e-openwrt.config        # 内核 fragment：我们额外要求 builtin 的顶层 CONFIG
-├── patches/                      # 可选：本仓库自己的额外 patch（若有）
+├── patches/
+│   └── 0001-aic8800-kbuild-wiring.patch  # 把 vendor/aic8800 接进 drivers/net/wireless
+├── vendor/
+│   └── aic8800/                  # AIC8800 WiFi 驱动（DKMS 清洗移植，builtin 用）
 ├── scripts/
-│   ├── build.sh                  # clone + patch + fragment + make build
+│   ├── build.sh                  # clone + vendor + patch + fragment + make build
+│   ├── vendor-aic8800.sh         # 从 DKMS 源树生成 vendor/aic8800（含符号隔离）
 │   ├── post-process.sh           # deb → .ko.xz→.ko + modules.dep 修 + 提取未压缩 Image
 │   └── verify.sh                 # 校验关键模块是否真的进 vmlinux
 └── README.md
@@ -110,7 +114,7 @@ p3 里即可（分区 LBA 679936 / 488MB ext4）。参考 `docs/A5E-内核编译
   Actions container 无 binfmt_misc 会 `Exec format error`。**build.sh 已自动 `sed` 成 `HOSTCC=gcc`**
   （host 工具用 host gcc），target 内核仍交叉编译。本地有 binfmt 时两种都行。
 
-## Fragment 当前覆盖的 CONFIG（49 行）
+## Fragment 当前覆盖的 CONFIG（56 行）
 
 > 完整以 `configs/a5e-openwrt.config` 为准；下列按组概略。
 
@@ -122,12 +126,20 @@ p3 里即可（分区 LBA 679936 / 488MB ext4）。参考 `docs/A5E-内核编译
 - **透明代理**：`NFT_TPROXY` + `NF_TPROXY_IPV4/6` + `NF_SOCKET_IPV4/6` + `NF_DUP_IPV4/6/NETDEV`
 - **iptables 兼容层**（xt_tproxy 依赖）：`NETFILTER_XTABLES` + `IP_NF_IPTABLES/IP6_NF_IPTABLES/IP_NF_NAT/IP_NF_MANGLE` + `NETFILTER_XT_TARGET_TPROXY/REDIRECT` + `NETFILTER_XT_MATCH_SOCKET`
 - **支撑**：`NF_DEFRAG_IPV4/6`, `NF_LOG_SYSLOG`, `NF_FLOW_TABLE`, `NF_FLOW_TABLE_INET`
+- **无线（AIC8800 builtin）**：`WLAN`, `CFG80211`, `MAC80211`（依赖栈）+
+  `AICV_WLAN_SUPPORT`, `AICV8800_WLAN_SUPPORT`（vendor/aic8800 移植版，符号隔离自 bsp 自带副本），
+  `AIC_WLAN_SUPPORT=n`（保持 Radxa 对 bsp 副本的禁用），
+  `AIC_FW_PATH="/lib/firmware/aic8800_fw/SDIO/aic8800D80"`（板上实测固件路径，驱动 filp_open 直读）
+- 初始化走**异步内核线程**（轮询真 rootfs 就绪后再起）——在 initcall 里同步做会卡死启动，
+  三轮板验对照见 `docs/A5E-WiFi驱动-AIC8800-调研.md` §5 第三步；
+  用户态还需禁用 wpad 降权（§5 第四步），镜像侧待办清单见 §7
 
 ## 相关文档
 
 - 主项目：`../../OpenWrt-A5E-制作记录.md`（坑 7 讲清了 bridge 为什么加载不了）
 - 编译详细：`docs/A5E-内核编译-记录.md`（本 Actions 的前身调研 + 踩过的所有坑）
 - 替换流程：`docs/OpenWrt镜像-定制内核替换.md`（新内核塞进 `owrt-a5e.img` 的可复用步骤）
+- WiFi 驱动：`docs/A5E-WiFi驱动-AIC8800-调研.md`（AIC8800 DKMS 驱动结构、固件机制、集成路线图）
 
 ## License / 上游许可
 

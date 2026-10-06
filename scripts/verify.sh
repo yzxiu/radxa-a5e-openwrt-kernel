@@ -41,17 +41,23 @@ if [ ! -f "$FRAGMENT" ]; then
   echo "✗ 找不到 fragment：$FRAGMENT（无法核对目标 CONFIG）"; exit 1
 fi
 
-echo "=== 1. fragment 要求的 CONFIG 是否全部 =y（内建进 vmlinux）==="
+echo "=== 1. fragment 要求的 CONFIG 是否全部生效（=y 内建 / =n 禁用 / 字符串值匹配）==="
 total=0; bad=0
 for c in $(grep '^CONFIG_' "$FRAGMENT" | sed 's/=.*//'); do
   total=$((total+1))
+  want=$(grep -E "^${c}=" "$FRAGMENT" | head -1)
   line=$(grep -E "^${c}=" "$CONFIG" | head -1)
-  if [ "$line" = "${c}=y" ]; then
-    :   # ✓ 静默（项多，全绿时只报汇总）
-  else
-    echo "  ✗ ${c}  →  ${line:-（config 里没有该行）}"
-    bad=$((bad+1))
-  fi
+  case "$want" in
+    "${c}=y")
+      [ "$line" = "${c}=y" ] || { echo "  ✗ ${c}  →  ${line:-（config 里没有该行）}"; bad=$((bad+1)); } ;;
+    "${c}=n")
+      # =n：config 里必须不是 =y（写成 "# X is not set" 或缺行都算通过）
+      [ "$line" = "${c}=y" ] && { echo "  ✗ ${c} 期望禁用但仍 =y"; bad=$((bad+1)); } ;;
+    "${c}=\""*)
+      [ "$line" = "$want" ] || { echo "  ✗ ${c}  →  ${line:-（config 里没有该行）}，期望 $want"; bad=$((bad+1)); } ;;
+    *)
+      echo "  ? ${c} 未识别的期望值：$want" ;;
+  esac
 done
 # 额外核对 Kconfig select 自动带出的（不写在 fragment 里，但必须 =y）
 for c in CONFIG_LLC CONFIG_STP; do
@@ -60,7 +66,7 @@ for c in CONFIG_LLC CONFIG_STP; do
   [ "$line" = "${c}=y" ] || { echo "  ✗ ${c}（BRIDGE select 带出）→ ${line:-缺}"; bad=$((bad+1)); }
 done
 if [ "$bad" = "0" ]; then
-  echo "  ✓ 全部 $total 项目标 CONFIG 都 =y（bridge 自动带出 LLC/STP 也在）"
+  echo "  ✓ 全部 $total 项目标 CONFIG 都与 fragment 一致（=y 内建 / =n 禁用 / 字符串匹配）"
 else
   echo "  ✗ $bad/$total 未内建"
 fi
@@ -69,7 +75,7 @@ echo
 
 # ---------- 2. 交叉验证：关键 tristate 模块已从 modules 目录消失（真进 vmlinux）----------
 echo "=== 2. 关键 tristate .ko 应已从模块目录消失（并进 vmlinux）==="
-for m in bridge br_netfilter nf_tables nf_conntrack nf_nat nft_ct nft_tproxy nft_fib; do
+for m in bridge br_netfilter nf_tables nf_conntrack nf_nat nft_ct nft_tproxy nft_fib cfg80211 mac80211; do
   # bool 类不在 builtin，只查 tristate；modules.builtin 有该 basename 且 modules 目录无同名 .ko 才算通过
   found_builtin=$(grep -E "/${m}\.ko$" "$BUILTIN" 2>/dev/null | head -1)
   leftover=$(find "$MODDIR" -name "${m}.ko" 2>/dev/null | head -1)
@@ -81,6 +87,33 @@ for m in bridge br_netfilter nf_tables nf_conntrack nf_nat nft_ct nft_tproxy nft
     echo "  ? ${m}.ko 不在 modules.builtin（若是 bool 则正常；tristate 则异常）"
   fi
 done
+echo
+
+# ---------- 2.5 wifi：aic8800 应整体 builtin，模块目录里一个 .ko 都不剩 ----------
+echo "=== 2.5 aic8800 是否已整体内建（无 .ko 残留）==="
+aic_ko=$(find "$MODDIR" -name "aic*.ko" 2>/dev/null | wc -l)
+if [ "$aic_ko" = "0" ]; then
+  echo "  ✓ 模块目录无 aic*.ko（bsp/fdrv 已进 vmlinux，btlpm 未启用）"
+else
+  echo "  ✗ 仍有 $aic_ko 个 aic*.ko："; find "$MODDIR" -name "aic*.ko" | sed 's/^/    /'; fail=$((fail+1))
+fi
+# 交叉验证：vmlinux 里同时存在 fdrv 原名符号与 bsp 改名符号
+echo "=== 2.6 vmlinux 符号抽查（aic8800 真身）==="
+VMLINUX="$REPO_DIR/kernel/src/vmlinux"
+if [ -f "$VMLINUX" ] && command -v aarch64-linux-gnu-nm >/dev/null 2>&1; then
+  ok=1
+  # 注意: nm 输出大，grep -q 命中即退会让 nm 吃 SIGPIPE，pipefail 下管道失败 →
+  # 必须先落盘再 grep，不能 nm | grep -q
+  SYMS="$(mktemp)"; aarch64-linux-gnu-nm "$VMLINUX" > "$SYMS" 2>/dev/null
+  grep -q " [tT] aicbsp_init$" "$SYMS" || { echo "  ✗ vmlinux 缺 aicbsp_init"; ok=0; }
+  grep -q " [tT] aicwf_sdio_bus_init$" "$SYMS" || { echo "  ✗ vmlinux 缺 aicwf_sdio_bus_init(fdrv)"; ok=0; }
+  grep -q " [tT] aicv_bsp_aicwf_sdio_bus_init$" "$SYMS" || { echo "  ✗ vmlinux 缺 aicv_bsp_aicwf_sdio_bus_init(bsp 改名侧)"; ok=0; }
+  rm -f "$SYMS"
+  [ "$ok" = "1" ] && echo "  ✓ aicbsp_init / aicwf_sdio_bus_init / aicv_bsp_* 均在 vmlinux"
+  [ "$ok" = "1" ] || fail=$((fail+1))
+else
+  echo "  （跳过：无 vmlinux 或 aarch64-linux-gnu-nm）"
+fi
 echo
 
 # ---------- 3. 无 .ko.xz 残留 ----------

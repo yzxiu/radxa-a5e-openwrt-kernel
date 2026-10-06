@@ -3,9 +3,14 @@ name: Build A5E OpenWrt Kernel
 # 触发方式：
 #   1) 手动 dispatch：可选填 kernel_ref（上游 linux-aw2607 的分支/tag/sha），
 #      不填默认 main
-#   2) push：改 configs/** / patches/** / scripts/** / workflow 时自动构建
-# 每次成功构建都会发布一个**正式 release**（不带 prerelease），tag 按 UTC 日期时分秒
-# +run号 生成唯一名，不依赖人工打 v* tag 触发。
+#   2) push：**任意分支**，改 configs/** / patches/** / scripts/** / vendor/** /
+#      workflow 时自动构建
+#
+# Release 发布策略（重要）：**只有 main 分支发正式 release**。
+#   其他分支只构建 + 上传 artifact，不发 release —— 因为下游 image 仓
+#   （radxa-a5e-openwrt 的 25-fetch-kernel.sh）取的是“最新一条非 draft release，
+#   prerelease 也算”，分支构建若发 release 会被误当成正式内核消费。
+#   tag 按 UTC 日期时分秒+run号 生成唯一名，不依赖人工打 v* tag 触发。
 
 on:
   workflow_dispatch:
@@ -15,11 +20,12 @@ on:
         required: false
         default: 'main'
   push:
-    branches: [main]
+    branches: ['**']
     paths:
       - 'configs/**'
       - 'patches/**'
       - 'scripts/**'
+      - 'vendor/**'
       - '.github/workflows/build.yml'
 
 permissions:
@@ -100,10 +106,10 @@ jobs:
         uses: actions/cache@v4
         with:
           path: kernel
-          # cache key 由本仓库配置 + 上游 ref + scripts 共同决定。
-          # 加入 scripts/**：URL/构建脚本改动会让 key 变，强制重建，
+          # cache key 由本仓库配置 + 上游 ref + scripts/vendor 共同决定。
+          # 加入 scripts/** 与 vendor/**：URL/构建脚本/驱动源码改动会让 key 变，强制重建，
           # 避免 fork 后 commit sha 与上游相同导致旧 clone 被误复用、改了等于没改。
-          key: kernel-src-${{ inputs.kernel_ref || 'main' }}-${{ hashFiles('configs/**', 'patches/**', 'scripts/**') }}
+          key: kernel-src-${{ inputs.kernel_ref || 'main' }}-${{ hashFiles('configs/**', 'patches/**', 'scripts/**', 'vendor/**') }}
           restore-keys: |
             kernel-src-${{ inputs.kernel_ref || 'main' }}-
             kernel-src-main-
@@ -120,7 +126,7 @@ jobs:
       - name: post-process (.ko.xz → .ko, plain Image, sha256)
         run: ./scripts/post-process.sh
 
-      - name: verify (bridge + fw4 + tproxy 都进 vmlinux)
+      - name: verify (bridge + fw4 + tproxy + aic8800 wifi 都进 vmlinux)
         run: ./scripts/verify.sh
 
       # BUILD_INFO.env 由 post-process.sh 末尾生成（用 Actions 自动注入的 GITHUB_*
@@ -143,11 +149,11 @@ jobs:
           retention-days: 60
           if-no-files-found: error
 
-  # 构建成功后发 Release：每次成功构建 → 一条正式 release
-  # （tag = rel-<UTC 日期时分秒>-r<run号>，唯一不覆盖、不依赖 v* tag 触发）
+  # 构建成功后发 Release：**仅 main 分支**（其他分支只出 artifact，理由见文件头注释）
+  # tag = rel-<UTC 日期时分秒>-r<run号>，唯一不覆盖、不依赖 v* tag 触发
   release:
     needs: build
-    if: needs.build.result == 'success'
+    if: needs.build.result == 'success' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04
     permissions:
       contents: write
