@@ -153,7 +153,7 @@ s = s.replace(old, new)
 open(p, 'w').write(s)
 PYEOF
 
-# ---- 调试：filp_open 失败时打印 errno（板上定位固件加载问题用，验证后移除）----
+# ---- 诊断增强：filp_open 失败时打印 errno（上游只打文件名，固件路径错时排障无从下手）----
 sed -i 's|printk("%s: %s file failed to open\\n", __func__, name);|printk("%s: %s file failed to open, err=%ld\\n", __func__, name, PTR_ERR(fp));|' "$DST/aic8800_bsp/aic_bsp_driver.c"
 
 # ---- bsp 侧同名内部符号去重（builtin 必需）----

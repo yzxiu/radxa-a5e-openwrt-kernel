@@ -1,7 +1,8 @@
 # A5E WiFi 驱动（AIC8800）调研与集成方案
 
-> 状态：**驱动已 builtin 化并本地构建验证通过**（2026-10-06，feature/aic8800-builtin）。
-> 板上验证：模块方案已点亮（scan/AP 均通，见 §5 第一步记录）；builtin 内核待烧录验收。
+> 状态：✅ **全部完成并板上验收**（2026-10-06，`feature/aic8800-builtin`）。
+> 驱动 builtin 进 vmlinux，冷启动零人工干预，~8s 自动出 AP 并桥接进 br-lan（见 §5 验收记录）。
+> 踩过的坑全部沉淀在 §5 第三/四步；image 仓待办见 §7。
 > bridge/firewall4 早前已根治（builtin）并烧录验收。
 > 相关：[A5E-内核编译-记录.md](A5E-内核编译-记录.md)（内核流水线）、
 > [OpenWrt镜像-定制内核替换.md](OpenWrt镜像-定制内核替换.md)（镜像替换流程）、
@@ -11,12 +12,14 @@
 
 | 项 | 结论 |
 |---|---|
-| 芯片 | AIC8800（板载，SDIO 接口，WiFi6 单天线） |
-| 驱动形态 | **DKMS 外置包**（`aic8800-sdio 5.0+git20260123`），不在内核源码树内 |
-| 内核 ABI | Radxa 预编译 `.ko` 的 vermagic = `6.6.98-1-aw2607`，与本仓库内核**完全兼容，可直接复用** |
-| 固件 | 必须随镜像分发（`request_firmware()` 运行时加载），约 300KB+ |
-| 当前镜像 | **无驱动、无固件**，WiFi 完全不可用 |
-| 推荐路线 | ✅ ① 模块手动注入板上验证通过 → ✅ ② builtin 化完成（vendor 进内核树） |
+| 芯片 | AIC8800**D80**（板载 SDIO，2.4G 单频，HT/VHT/HE 全支持；vid `0xC8A1`） |
+| 驱动形态 | 上游是 **DKMS 外置包**（`aic8800-sdio 5.0+git20260123`），不在内核源码树内 |
+| 本仓库做法 | 把该 DKMS 源码**清洗移植进内核树 builtin**（`vendor/aic8800`，符号隔离 `AICV_*`） |
+| 固件 | 必须随镜像分发；驱动用 **`filp_open` 直读**（非 `request_firmware`），路径由
+  `CONFIG_AIC_FW_PATH` 编译期写死 = `/lib/firmware/aic8800_fw/SDIO/aic8800D80` |
+| 初始化时机 | **异步内核线程**，轮询真 rootfs 就绪后初始化（initcall 里同步做会卡死启动，见 §5 第三步） |
+| 用户态 | 需禁用 wpad 降权（否则 hostapd 不注册 ubus 对象，AP 永远起不来，见 §5 第四步） |
+| 验收 | ✅ 冷启动零干预：`phy0-ap0` AP-ENABLED + 桥接 br-lan，`lsmod` 无 aic |
 
 ## 1. 硬件
 
@@ -143,21 +146,23 @@ aic8800p_fdrv），`device-a527` 的 `bsp_defconfig` 也启用了它
 本地 16 核全量构建通过，verify.sh 全绿；vmlinux 内同时存在 fdrv 原名符号
 与 bsp 改名符号，链接语义与双模块运行时一致。
 
-## 4. 镜像缺口（内核侧已清零，只剩固件分发）
+## 4. 镜像缺口（内核侧已清零，剩固件 + 用户态两处）
 
 对照本仓库产物与 image 仓（`radxa-a5e-openwrt`）流水线实测：
 
 1. ~~kernel 产物里没有 aic8800 模块~~ **✅ 已根治**：驱动整体 builtin，
    模块目录无任何 `aic*.ko`（bsp/fdrv 进 vmlinux）；
 2. ~~cfg80211/mac80211 是 `.ko` 模块~~ **✅ 已根治**：随 fragment `=y` builtin；
-3. **⬜ 镜像里没有固件**——`custom/rootfs` 与 armsr rootfs 的 `/lib/firmware/` 为空，
-   需要 image 仓把 `aic8800_fw/SDIO/aic8800D80/` 拷进 `/lib/firmware/`
-   （板上实测驱动读的是 `CONFIG_AIC_FW_PATH` 目录下的
-   `fmacfw_8800d80_u02.bin` 等，见 §5 记录）。
+3. **⬜ 镜像里没有固件**——需把 `aic8800_fw/SDIO/aic8800D80/` 拷进 `/lib/firmware/`
+   （驱动 filp_open 直读该目录，路径编译期写死）；
+4. **⬜ wpad 默认降权到 `network` 用户 → hostapd 不注册 ubus 对象** → AP 起不来
+   （详见 §5 第四步，一行改名即可修）；
+5. **⬜ armsr rootfs 缺 `iw` / `wifi-scripts` 两个包**——`/sbin/wifi` 命令来自
+   `wifi-scripts`（25.12 才拆出来的新包），没有它 `wifi config/up` 全都 `not found`；
+   `iw` 用于调试。需 `apk add iw wifi-scripts` 或预置进镜像。
 
-用户态**无缺口**：armsr rootfs 自带 `wpad`/`hostapd`/`wpa_supplicant`、
-`iwinfo` 库与 netifd 无线支持；缺 `iw` CLI（调试可选，可用 `iwinfo` 替代）。
-驱动起来后 `/etc/config/wireless` 由 uci 首次生成。
+> 注：用户态原本以为"无缺口"（wpad/hostapd/iwinfo 库都在），实测下来 3/4/5 三项
+> 都得在 image 仓处理，清单见 §7。
 
 ## 5. 路线图
 
@@ -188,22 +193,112 @@ lib/firmware/aic8800_fw/SDIO/aic8800/   ← 先按 §2.3 对齐后的结论拷
 - [ ] uci/netifd 自动配 AP（`wifi up`）：**卡 `command failed: Not supported (-95)`**，
       纯软件集成问题，netifd/wifi-scripts 对 fullmac 驱动的兼容，待单独排查
 
-### 第二步：根治 ✅ 已完成（走了方案 B 的改进版）
+### 第二步：根治 ✅ 已完成并板上验收（走了方案 B 的改进版）
 
-按 §3.2 落地：vendor 进内核树 builtin（方案 B），但用**板上验证过的 DKMS 源码**
-而非 bsp 副本，并用符号隔离 + 54 个内部符号改名解决双模块私有副本的 builtin
-链接障碍。本地全量构建 + verify.sh 全绿。
+按 §3.2 落地：vendor 进内核树 builtin，用**板上验证过的 DKMS 源码**而非 bsp 副本，
+符号隔离 + 54 个内部符号改名解决双模块私有副本的 builtin 链接障碍。
 
-**剩余工作**：
-1. 用新内核 + 固件组装镜像烧录，板上复验（wlan0 应开机自动出现，无需任何 insmod）；
-2. image 仓（radxa-a5e-openwrt）加固件分发步骤（`aic8800_fw/SDIO/aic8800D80/` →
-   `/lib/firmware/`）；aic8800 模块注入步骤**不再需要**；
-3. uci/netifd `-95` 问题单独排查（见 §5 清单最后一项）。
+### 第三步：builtin 冷启动时序（三轮板验，最大的坑）
 
-### 文档同步
+builtin 把驱动初始化从"用户态 insmod"提前到了 initcall，撞上三个时序问题：
 
-验证结论（固件目录、模块加载顺序、hostapd 配置）回填本文档 §2.3 与
-主项目《OpenWrt-A5E-制作记录.md》展望节。
+| 轮次 | 现象 | 根因 |
+|---|---|---|
+| 1 | `0.34s` `set power on fail`，无 wlan0 | `device_initcall` 早于 PMIC 稳压器 / sunxi-rfkill(~3.1s) / mmc2 枚举 |
+| 2 | 改 `late_initcall` + 固件塞进 initramfs：供电✓、SDIO probe✓、固件 md5✓、`phy0` 注册✓，**但随后 `/init` 卡死，rootfs 永不挂载** | WiFi 在 initramfs 阶段"活着"与 `/init` 冲突（四轮对照实验的唯一变量） |
+| 3 | ✅ **异步延迟初始化** | 见下 |
+
+**最终方案**（`scripts/vendor-aic8800.sh` 里的 `aicv_wifi_init_thread`）：
+
+```
+late_initcall 只 kthread_run 一个 "aic8800_init" 线程就立即返回（启动零阻塞）
+  └─ 线程轮询 CONFIG_AIC_FW_PATH 目录是否可见（= switch_root 完成的天然信号）
+       └─ 可见后调 rwnx_mod_init()  →  固件从真 rootfs 读，一次成功
+```
+
+配套细节：`rwnx_mod_init` 必须**去掉 `__init` 标记**（线程在 initmem 释放后运行；
+其调用链已逐个核实无 `__init`）。
+
+**核心认知（值得记住）**：initcall 里做任何"等 rootfs"的阻塞都是自杀——
+rootfs 由 initramfs 的用户态 `/init` 挂载，而 `/init` 要等所有 initcall 结束才开始。
+第 2 轮的"轮询重试"补丁就是这么把启动从 7.6s 拖到 31s 的。
+
+**附带教训（initramfs 多段拼接）**：第 2 轮曾把固件 cpio **追加在 initrd 尾部**，
+内核报 `Initramfs unpacking failed: invalid magic at start of compressed archive`——
+`unpack_to_rootfs()` 要求 cpio 段起始 **4 字节对齐**（`if (*buf == '0' && !(this_header & 3))`），
+而 gzip 段结束点 `46808279 % 4 = 3` 不对齐 → 追加段被当垃圾丢弃。
+**正确做法是前置**（`fw.cpio + 原 initrd`，microcode 标准布局，cpio 工具输出天然 512 对齐）。
+（最终方案不再需要动 initrd，但这条经验对任何 initramfs 拼接都适用。）
+
+### 第四步：OpenWrt 用户态把 AP 拉起来（两个真坑 + 一个假坑）
+
+内核侧通了之后，`uci`/netifd 仍起不了 AP。排查结论：
+
+**假坑：`command failed: Not supported (-95)`**
+来自 `mac80211.sh` 的 `setup_phy()` 用 `system()` 调的
+`iw phy phy0 set antenna 0xffffffff 0xffffffff`——fullmac 驱动没实现 `.set_antenna`。
+**非致命**（返回值被忽略），一度被误判为根因。
+
+**假坑 2：`vif_radio_mask`**
+`/usr/share/hostap/common.uc` 的 `wdev_create()` 会发 `NL80211_ATTR_VIF_RADIO_MASK`
+（Wi-Fi 7 多射频属性，内核 6.15+ 才有；我们 6.6 的 `nl80211.h` 里 grep 不到）。
+看着像版本代差，但**去掉后依旧失败**，不是致命原因。
+
+**真坑：wpad 降权后 hostapd 不注册 ubus 对象** ← 致命
+
+```
+/usr/share/hostap/common.uc  →  hostapd.uc:601
+    if (!global.ubus.list('hostapd'))
+            system('ubus wait_for hostapd');     ← 永久阻塞在这
+```
+
+`ubus list` 里没有 `hostapd` 对象 → wifi-scripts 死等 → radio 永久 `pending`、
+接口不创建、`/var/run/hostapd-*.conf` 不生成、netifd 每 30s  tear down/Starting 空转。
+
+隔离实验（决定性）：
+
+| hostapd 运行方式 | 用户 | ubus 对象 |
+|---|---|---|
+| 直接跑 / procd 不降权 | root | ✅ `hostapd` `hostapd-auth` `hostapd.phy0-ap0` |
+| procd 降权（无 jail） | network | ❌ 无 |
+| procd 降权 + ujail（默认） | network | ❌ 无 |
+
+→ **与 jail 无关，纯粹是降权到 `network` 用户导致**（`chmod 1777 /var/run`、
+给 `wpad.json` 加 `CAP_DAC_OVERRIDE` 都无效）。
+
+**修法**（一行，已板上验证）：让 `/etc/init.d/wpad` 里的 jail 条件为假即可
+（`[ -x /sbin/ujail -a -e /etc/capabilities/wpad.json ]`）：
+
+```bash
+mv /etc/capabilities/wpad.json /etc/capabilities/wpad.json.disabled
+```
+
+**另一个必踩点：`wifi config` 自动生成的频段是错的**
+本芯片 Band 1（2.4G）只有 HT/VHT、**无 HE**，且是 2.4G 单频；
+自动生成却写 `band 5g / channel 36 / HE80`（生成时 `iwinfo` 缺失导致误判）。
+必须手工改成：
+
+```bash
+uci set wireless.radio0.band=2g
+uci set wireless.radio0.channel=6
+uci set wireless.radio0.htmode=HT20
+```
+
+### 最终验收记录（冷启动、零人工干预）
+
+```
+up 2 min
+[    6.145424] aic8800: rootfs ready (~2s), init wifi      ← 异步线程只等了 2s
+[    8.168293] ieee80211 phy0: HT supp 1, VHT supp 1, HE supp 1
+phy0-ap0: <BROADCAST,MULTICAST,UP,LOWER_UP> master br-lan state UP
+ubus network.wireless: "up": true, "pending": false
+iw dev: phy0-ap0  type AP  ssid ImmortalWrt  channel 6 (2437 MHz), 20 MHz
+brctl show br-lan: eth0 + phy0-ap0
+hostapd: phy0-ap0: AP-ENABLED
+lsmod | grep -c aic  →  0                                   ← 真 builtin
+```
+
+开机约 8 秒 WiFi AP 自动就绪并桥接进 LAN。
 
 ## 6. 待验证问题清单
 
@@ -214,5 +309,31 @@ lib/firmware/aic8800_fw/SDIO/aic8800/   ← 先按 §2.3 对齐后的结论拷
 | 3 | hotplug/kmodloader 自动加载 | ✅ 不再需要——驱动 builtin，开机即在场 |
 | 4 | AIC_FW_PATH 指向 | ✅ `/lib/firmware/aic8800_fw/SDIO/aic8800D80`（已固化在 fragment） |
 | 5 | modinfo 声明的固件 | ✅ 实际只读 `fmacfw_8800d80_u02.bin` 等 D80 文件，无 request_firmware |
-| 6 | builtin 内核板上复验（wlan0 自动出现、hostapd 可用） | ⬜ 待烧录新镜像验证 |
-| 7 | uci/netifd `wifi up` 的 `-95`（fullmac 兼容） | ⬜ 待排查（不影响手工 hostapd） |
+| 6 | builtin 内核板上复验 | ✅ 冷启动零干预，AP-ENABLED + 桥接 br-lan（§5 验收记录） |
+| 7 | uci/netifd `-95` | ✅ 假坑：`iw set antenna` 的噪音，非致命。真坑是 wpad 降权后 hostapd 不注册 ubus 对象（§5 第四步） |
+| 8 | initcall 里能否等 rootfs | ❌ 不能——rootfs 由 initramfs 的 /init 挂载，而 /init 等 initcall 结束；必须异步线程 |
+| 9 | initrd 多段拼接 | ✅ 固件段必须**前置**（追加在 gzip 段尾部会因 4 字节不对齐被内核丢弃） |
+
+
+## 7. image 仓（radxa-a5e-openwrt）待办
+
+内核侧已全部搞定，镜像侧还需要 4 件事：
+
+1. **固件分发**：把 `aic8800_fw/SDIO/aic8800D80/`（15 个文件，~1.7MB；来源 Radxa
+   Debian rootfs 的 `/usr/lib/firmware/`）拷到 rootfs 的 `/lib/firmware/aic8800_fw/SDIO/`。
+   ⚠️ 路径必须与 fragment 里的 `CONFIG_AIC_FW_PATH` 完全一致（驱动 filp_open 直读，
+   不走 request_firmware，路径错了就是静默失败）。
+2. **禁用 wpad 降权**：`/etc/capabilities/wpad.json` 改名或删除（§5 第四步），
+   否则 hostapd 不注册 ubus 对象、AP 永远起不来。
+3. **预置 `/etc/config/wireless`**：`band=2g channel=6 htmode=HT20`（别让
+   `wifi config` 猜成 5g/HE80），或至少在文档里写明首次需手工改。
+4. **补两个用户态包**：`iw` + `wifi-scripts`（后者提供 `/sbin/wifi`，25.12 新拆包；
+   缺了它 `wifi config`/`wifi up` 全部 `not found`）。
+5. **内核资产**：直接用 kernel 仓 release 的 `vmlinuz` + `modules-and-dtb.tar`；
+   模块树里**不会**有 `aic*.ko`（已 builtin），这是正常的，不要当成缺失。
+   `initrd` **无需任何改动**。
+
+## 8. 文档同步
+
+主项目《OpenWrt-A5E-制作记录.md》展望节的"WiFi 调通"一项可以关闭，
+并补记 §5 第三步（initcall 时序）与第四步（wpad 降权）两个坑。
