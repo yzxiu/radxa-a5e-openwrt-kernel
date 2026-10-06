@@ -6528,7 +6528,7 @@ void aicwf_hostif_fail(void)
 	complete(&hostif_register_done);
 }
 
-static int __init rwnx_mod_init(void)
+static int rwnx_mod_init(void)
 {
 	RWNX_DBG(RWNX_FN_ENTRY_STR);
 	rwnx_print_version();
@@ -6599,7 +6599,42 @@ MODULE_IMPORT_NS(VFS_internal_I_am_really_a_filesystem_and_am_NOT_a_driver);
 #endif
 #endif
 
-late_initcall(rwnx_mod_init);
+/* ==== aicv: 异步延迟初始化 ====
+ * initcall 里同步初始化会在 initramfs 阶段读不到固件（或与其 /init 冲突卡死启动）。
+ * 改为内核线程轮询真 rootfs 里的固件目录（= switch_root 完成信号），就绪后再初始化。
+ * 时序等价于 DKMS 模块方案（systemd 在 rootfs 上 insmod），板上已验证可用。 */
+#include <linux/kthread.h>
+
+static int aicv_wifi_init_thread(void *unused)
+{
+	int i;
+	bool ready = false;
+
+	for (i = 0; i < 90; i++) {	/* 最长 ~180s */
+		struct file *f = filp_open(CONFIG_AIC_FW_PATH, O_RDONLY, 0);
+
+		if (!IS_ERR(f)) {
+			filp_close(f, NULL);
+			ready = true;
+			pr_info("aic8800: rootfs ready (~%ds), init wifi\n", i * 2);
+			break;
+		}
+		msleep(2000);
+	}
+	if (!ready) {
+		pr_err("aic8800: %s not visible in 180s, give up\n", CONFIG_AIC_FW_PATH);
+		return -ENODEV;
+	}
+	return rwnx_mod_init();
+}
+
+static int __init rwnx_mod_init_async(void)
+{
+	struct task_struct *t = kthread_run(aicv_wifi_init_thread, NULL, "aic8800_init");
+
+	return PTR_ERR_OR_ZERO(t);
+}
+late_initcall(rwnx_mod_init_async);
 module_exit(rwnx_mod_exit);
 
 MODULE_FIRMWARE(RWNX_CONFIG_FW_NAME);

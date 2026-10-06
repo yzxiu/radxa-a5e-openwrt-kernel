@@ -578,7 +578,7 @@ int rwnx_load_firmware(u32 **fw_buf, const char *name, struct device *device)
 	/* open the firmware file */
 	fp = filp_open(path, O_RDONLY, 0);
 	if (IS_ERR_OR_NULL(fp)) {
-		printk("%s: %s file failed to open\n", __func__, name);
+		printk("%s: %s file failed to open, err=%ld\n", __func__, name, PTR_ERR(fp));
 		*fw_buf = NULL;
 		__putname(path);
 		fp = NULL;

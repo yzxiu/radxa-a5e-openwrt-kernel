@@ -87,14 +87,74 @@ find "$DST" -name 'Kconfig*' -exec sed -i \
   -e 's/\bAIC_WLAN_SUPPORT\b/AICV_WLAN_SUPPORT/g' \
   {} +
 
-# ---- 初始化时机：device_initcall → late_initcall ----
-# builtin 时 aic 的 module_init 在 0.34s 就执行，早于 PMIC(axp2202) 稳压器、
-# sunxi-rfkill（~3.1s）、mmc2/sdio 枚举等基础设施，aicbsp_platform_power_on 必失败
-# （板上实测：fail to set AIC_WIFI power state to 1）。模块方案没这问题纯粹因为
-# insmod 时基础设施早已就绪。改成 late_initcall 等它们全部就位。
-# 注意：本移植只用于 builtin，此改动对模块构建不适用（也不需要）。
+# ---- 初始化时机：异步线程 + 等真 rootfs 就绪 ----
+# 为什么不能在 initcall 里同步初始化（板上实测三轮）：
+#   1) device_initcall（0.34s）：早于 PMIC 稳压器 / sunxi-rfkill / mmc2 枚举，供电必败
+#   2) late_initcall + initramfs 里塞固件：固件能读到、驱动能完整初始化，
+#      但 initramfs 阶段的 /init 随后卡死（WiFi 活着时启动挂死，四轮对照实验唯一变量）
+#   3) 本方案：late_initcall 只 kthread_run 一个线程立即返回（启动零阻塞），
+#      线程里轮询真 rootfs 的固件目录（= switch_root 完成信号）后才初始化。
+#      该时序等价于 DKMS 模块方案（systemd 在 rootfs 上 insmod），板上已验证可用；
+#      固件也回归“只在 rootfs”，initrd 不需任何改动。
+# 注意：线程在 initmem 释放后运行，rwnx_mod_init 必须去掉 __init 标记
+#（其调用链已逐个核实无 __init：rwnx_print_version / rwnx_init_cmd_array /
+#  aicsmac_driver_register / aicbsp_set_subsys 均为普通函数）。
 sed -i 's/^module_init(aicbsp_init);/late_initcall(aicbsp_init);/' "$DST/aic8800_bsp/aic_bsp_main.c"
-sed -i 's/^module_init(rwnx_mod_init);/late_initcall(rwnx_mod_init);/' "$DST/aic8800_fdrv/rwnx_main.c"
+python3 - "$DST/aic8800_fdrv/rwnx_main.c" <<'PYEOF'
+import sys
+p = sys.argv[1]
+s = open(p).read()
+
+# 1) 去掉 __init（异步线程调用时 initmem 已释放）
+old_def = 'static int __init rwnx_mod_init(void)'
+assert old_def in s, 'rwnx_mod_init 定义未找到'
+s = s.replace(old_def, 'static int rwnx_mod_init(void)')
+
+# 2) late_initcall 改为异步线程包装
+old = 'module_init(rwnx_mod_init);'
+new = '''/* ==== aicv: 异步延迟初始化 ====
+ * initcall 里同步初始化会在 initramfs 阶段读不到固件（或与其 /init 冲突卡死启动）。
+ * 改为内核线程轮询真 rootfs 里的固件目录（= switch_root 完成信号），就绪后再初始化。
+ * 时序等价于 DKMS 模块方案（systemd 在 rootfs 上 insmod），板上已验证可用。 */
+#include <linux/kthread.h>
+
+static int aicv_wifi_init_thread(void *unused)
+{
+\tint i;
+\tbool ready = false;
+
+\tfor (i = 0; i < 90; i++) {	/* 最长 ~180s */
+\t\tstruct file *f = filp_open(CONFIG_AIC_FW_PATH, O_RDONLY, 0);
+
+\t\tif (!IS_ERR(f)) {
+\t\t\tfilp_close(f, NULL);
+\t\t\tready = true;
+\t\t\tpr_info("aic8800: rootfs ready (~%ds), init wifi\\n", i * 2);
+\t\t\tbreak;
+\t\t}
+\t\tmsleep(2000);
+\t}
+\tif (!ready) {
+\t\tpr_err("aic8800: %s not visible in 180s, give up\\n", CONFIG_AIC_FW_PATH);
+\t\treturn -ENODEV;
+\t}
+\treturn rwnx_mod_init();
+}
+
+static int __init rwnx_mod_init_async(void)
+{
+\tstruct task_struct *t = kthread_run(aicv_wifi_init_thread, NULL, "aic8800_init");
+
+\treturn PTR_ERR_OR_ZERO(t);
+}
+late_initcall(rwnx_mod_init_async);'''
+assert old in s, 'module_init(rwnx_mod_init) 未找到'
+s = s.replace(old, new)
+open(p, 'w').write(s)
+PYEOF
+
+# ---- 调试：filp_open 失败时打印 errno（板上定位固件加载问题用，验证后移除）----
+sed -i 's|printk("%s: %s file failed to open\\n", __func__, name);|printk("%s: %s file failed to open, err=%ld\\n", __func__, name, PTR_ERR(fp));|' "$DST/aic8800_bsp/aic_bsp_driver.c"
 
 # ---- bsp 侧同名内部符号去重（builtin 必需）----
 # DKMS 双模块架构里 bsp/fdrv 各自带一份私有同名副本（md5、SDIO 传输层、cmd 助手、
